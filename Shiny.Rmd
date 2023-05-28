@@ -6,6 +6,44 @@ output: html_document
 ---
 
 ```{r}
+# List of packages to install
+pkg_list <- c("dplyr", "stringr", "caret", "plotly", 
+              "shiny", "bslib", "shinydashboard", "kernlab")
+
+# Bioconductor packages
+bioconductor_packages <- c("GEOquery", "Biobase", "limma")
+
+# Function to install packages if not already installed
+install_packages <- function(pkg_list){
+  for(pkg in pkg_list){
+    if(!pkg %in% installed.packages()){
+      install.packages(pkg, dependencies = TRUE)
+      print(paste(pkg, "has been installed successfully!"))
+    } else {
+      print(paste(pkg, "is already installed."))
+    }
+  }
+}
+
+# Function to install Bioconductor packages if not already installed
+install_bioconductor_packages <- function(pkg_list){
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+  for(pkg in pkg_list){
+    if(!pkg %in% installed.packages()){
+      BiocManager::install(pkg)
+      print(paste(pkg, "has been installed successfully!"))
+    } else {
+      print(paste(pkg, "is already installed."))
+    }
+  }
+}
+
+# Call the functions with your list of packages
+install_packages(pkg_list)
+install_bioconductor_packages(bioconductor_packages)
+
 library(GEOquery)
 library(dplyr)
 library(stringr)
