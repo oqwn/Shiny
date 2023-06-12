@@ -1,0 +1,1429 @@
+---
+title: "NephroPulse"
+subtitle: "A patient-focused interface to predict the success of kidney transplant survival"
+author: "Kidney A8"
+date: ""
+output:
+  rmdformats::robobook:
+    self_contained: true
+    highlight: tango
+    fig_caption: true
+    number_sections: false
+    gallery: true
+    thumbnails: true
+    lightbox: true
+    code_folding: hide
+    
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r pca batch correction prep, include = FALSE}
+library(GEOquery)
+library(dplyr)
+library(stringr)
+library(sva)
+library(Biobase)
+library(caret)
+library(cvTools)
+library(limma)
+
+set.seed(1)
+
+# ------------------------------------- BATCH CORRECTION -----------------------
+# our primary dataset for binary model
+gse26 = getGEO("GSE26578")
+gse26 = gse26$GSE26578_series_matrix.txt.gz
+
+# our secondary dataset for batch correction
+gse14 = getGEO("GSE14328")
+gse14 = gse14$GSE14328_series_matrix.txt.gz
+
+gse25 = getGEO("GSE25902")
+gse25 = gse25$GSE25902_series_matrix.txt.gz
+
+# 411 common genes
+length(intersect(fData(gse26)$`Gene`, fData(gse14)$`Gene Symbol`))
+
+# prepping pData for combining
+# introduce a new column called graft_status with binary outcomes for gse26
+gse26_pData = pData(gse26) %>% 
+  mutate(graft_status = case_when(str_detect(pData(gse26)$`disease status:ch1`, fixed("stable")) ~ "stable transplant",
+                                  str_detect(pData(gse26)$`disease status:ch1`, fixed("acute")) ~ "acute rejection",
+                                  str_detect(pData(gse26)$`disease status:ch1`, fixed("dysfunction")) ~ "acute rejection"))
+
+
+# manually adding batch
+gse26_pData$batch = rep("A", nrow(gse26_pData))
+gse26_pData = gse26_pData %>% select(c(geo_accession, graft_status, batch))
+
+# prepping fData data for combining
+common_genes = intersect(fData(gse26)$`Gene`, fData(gse14)$`Gene Symbol`)
+gse26_index = fData(gse26) %>% filter(`Gene` %in% common_genes)
+
+# for fData, we take only the first uniquely occurring gene - this gives us the 411 common genes 
+gse26_unique = gse26_index %>% group_by(`Gene`) %>% slice_head(n = 1)
+gse26_fData = gse26_unique %>% mutate(ID = substring(ID, 1, 5))
+gse26_fData = gse26_fData %>% select(c(ID, Gene, GB_ACC, GeneDes))
+gse26_unique_index = gse26_fData$ID
+
+# prepping exprs for combining
+# taking aggregrate of the non-unique gene exprs
+gse26_exprs = exprs(gse26) %>% as.data.frame()
+gse26_exprs$full_geneID = rownames(gse26_exprs)
+gse26_exprs_grouped = gse26_exprs %>% mutate(geneID = substring(full_geneID, 1, 5)) %>% select(-full_geneID)
+gse26_exprs_grouped = gse26_exprs_grouped %>% group_by(geneID) %>% summarise_all(mean)
+gse26_exprs_grouped = gse26_exprs_grouped %>% filter(geneID %in% gse26_unique_index) %>% as.data.frame()
+rownames(gse26_exprs_grouped) = gse26_exprs_grouped$geneID
+gse26_exprs_grouped = gse26_exprs_grouped %>% select(-geneID)
+
+# for gse26, fData = gse26_fData, pData = gse26_pData, exprs = gse26_exprs_grouped
+
+# same thing for gse14
+# prepping pData for combining
+gse14_pData = pData(gse14) %>%
+  mutate(graft_status = case_when(str_detect(pData(gse14)$`characteristics_ch1`, fixed("stable")) ~ "stable transplant",
+                                  str_detect(pData(gse14)$`characteristics_ch1`, fixed("acute")) ~ "acute rejection"))
+
+# manually adding batch
+gse14_pData$batch = rep("B", nrow(gse14_pData))
+gse14_pData$geo_accession = rownames(gse14_pData)
+gse14_pData = gse14_pData %>% select(c(geo_accession, graft_status, batch))
+
+# prepping fData for combining
+gse14_index = fData(gse14) %>% filter(`Gene Symbol` %in% common_genes)
+
+# for fData, we take only the first uniquely occurring gene - this gives us the 411 common genes 
+gse14_unique = gse14_index %>% group_by(`Gene Symbol`) %>% slice_head(n = 1)
+gse14_fData = gse14_unique %>% select(c(ID, `Gene Symbol`, GB_ACC, `Gene Title`))
+gse14_unique_index = gse14_unique$ID
+
+# prepping exprs for combining 
+# taking aggregate of the non-unique exprs
+gse14_exprs = exprs(gse14) %>% as.data.frame()
+gse14_exprs$geneID = rownames(gse14_exprs) 
+gse14_exprs = gse14_exprs %>% filter(geneID %in% gse14_unique_index) %>% select(-geneID)
+
+# for gse14, pData = gse14_pData, fData = gse14_fData, exprs = gse14_exprs
+
+# combining
+combined_pData = rbind(gse26_pData, gse14_pData)
+combined_fData = gse26_fData %>% as.data.frame()
+combined_exprs = cbind(gse26_exprs_grouped, gse14_exprs)
+
+# building ExpressionSet object
+combined_pData = AnnotatedDataFrame(data = combined_pData)
+combined_gse = ExpressionSet(assayData = as.matrix(combined_exprs), phenoData = combined_pData, fData = combined_fData)
+fData(combined_gse) = combined_fData
+
+# batch correction
+pheno = pData(combined_gse)
+edata = exprs(combined_gse)
+batch = pheno$batch
+mod = model.matrix(~as.factor(graft_status), data = pheno)
+
+# non-parametric adjustment, mean-only version
+combat = sva::ComBat(dat = edata, batch = batch, mod = NULL, par.prior = FALSE, mean.only = TRUE)
+corrected_gse = ExpressionSet(assayData = as.matrix(combat), phenoData = combined_pData)
+fData(corrected_gse) = combined_fData
+
+# removing the one NaN row from exprs
+exprs_df = exprs(corrected_gse) %>% as.data.frame()
+df_without_na = exprs_df[complete.cases(exprs_df), ]
+
+fData_without_na = filter(fData(corrected_gse), ID != "ZH354")
+
+corrected_gse = ExpressionSet(assayData = as.matrix(df_without_na), phenoData = combined_pData)
+fData(corrected_gse) = fData_without_na
+```
+
+# Github repository
+
+[github repository for shiny](git@github.com:oqwn/Shiny.git)
+
+# Executive Summary
+
+Our project focuses on the early identification of kidney rejection following transplantation. We have developed three predictive models: a binary outcome model, a CADI Score model, and an IFTA Score model. These models utilize gene data and can be accessed by doctors through our user-friendly Shiny app.
+ 
+The main findings from our evaluation are as follows:
+ 
+* The CADI Model demonstrates a Mean Absolute Error of 2.20 and a Root Mean Squared Error of 2.55. The $R^2$ value of 0.38 indicates that the model explains 38% of the variance in the data.
+ 
+* The Binary Rejection Model achieves an impressive average accuracy and sensitivity of 0.96, highlighting its effectiveness in accurately classifying kidney rejection cases.
+ 
+* The IFTA Model shows a Mean Absolute Error of 0.68 and a Root Mean Squared Error of 0.90. The $R^2$ value of 0.21 suggests that the model explains 21% of the variance in the data.
+ 
+These findings indicate that our models possess a certain level of predictive ability. However, further improvements are needed, particularly in the CADI and IFTA models, to enhance their accuracy and precision.
+
+The practical relevance of our analysis lies in providing doctors with invaluable tools for the early prediction of kidney rejection post-transplant. By leveraging these models, doctors can promptly identify rejection cases, enabling them to consider alternative treatment methods and deliver high-quality care. Additionally, the models contribute to the reduction of unnecessary administration of immunosuppressive drugs by avoiding their prolonged usage when rejection is predicted.
+ 
+In summary, our project addresses the critical imperative of early detection of kidney rejection post-transplant. Through the development of predictive models and an accessible interface, we aim to improve patient outcomes, optimize treatment strategies, and minimize the risks associated with rejection and excessive utilization of immunosuppressive drugs.
+
+# Background 
+
+Kidney failures and diseases are highly prevalent in Australia. There are many people waiting on a transplant, however there is no mechanism to predict the success of the transplant. The Australian Institute of Health and Welfare (2023) shows “2 million hospitalisations recorded Chronic Kidney Disease as a diagnosis in 2020–21. Moreover, Chronic kidney disease contributed to around 11% of all deaths in Australia in 2020.” This attests to the brevity of the situation. Once a patient is matched with a kidney and undergoes transplant, we want to make sure that the allocation of resources and the kidney is utilised, and the patient is given quality care. 
+
+Immunosuppressive drugs are used post-transplant to lower the initial rejection the immune system expresses towards the kidney. “Immunosuppressive drugs are used for induction (intense immunosuppression in the initial days after transplantation), maintenance, and reversal of established rejection.” (Halloran, 2004) However, these drugs have harmful side effects and shouldn’t be used for longer than 6 months. Hence, there's a pressing need to predict early rejection or stability of the kidney transplant, so alternative treatments can be explored, reducing dependence on these drugs.
+
+This scenario foregrounds the relevance of our predictive model, which incorporates the calculation of i-IFTA (Interstitial Fibrosis and Tubular Atrophy) and CADI (Chronic Allograft Damage Index) scores. These are key indices of allograft health and potential predictors of long-term graft survival. The i-IFTA score aids in assessing the extent of damage in the transplanted kidney due to chronic rejection, while the CADI score offers a holistic assessment of chronic graft damage, potentially preceding clinical manifestations of rejection.
+
+Therefore, our model holds promise for enhancing the strategic and effective management of kidney transplant patients. By improving the accuracy and timeliness of rejection prediction, we can potentially minimise reliance on harmful immunosuppressive drugs, and consequently, elevate the lifespan and quality of life for kidney transplant recipients.
+
+
+# Methods
+
+![Figure 1. Our project workflow, which consists of four distinct phases.](workflow.png)
+
+## Data collection
+
+Our first step was to investigate the potential of gene expression values in predicting kidney condition from two different sources - peripheral blood genes and kidney biopsy genes. All data preprocessing and analysis was done in R (R Core Team, 2022). The datasets were imported into R as `ExpressionSet` objects from the `Biobase` package (Huber, et al., 2015). For each source, we investigated three different predictive algorithms - k-nearest neighbours (kNN), random forest (RF), and support vector machines (SVM). kNN was conducted with the `knn` function from the `class` package (Venables & Ripley, 2002), RF was conducted with the `randomForest` function from the `randomForest` package (Liaw & Wiener, 2002), and SVM was conducted with the `svm` function from the `e1071` package (Meyer, et al., 2023).
+
+Kidney biopsy datasets appeared to provide the highest accuracy for a binary prediction, and out of the three predictive algorithms, kNN had the highest accuracy and balanced accuracy. As a result, we chose to use kidney biopsy datasets, and we chose kNN as our predictive algorithm.
+
+An additional dataset, GSE25902 (Naesens, et al., 2011), was used to obtain source data for the CADI and i-IFTA scores. For this dataset, four models were tested – kNN, RF, SVM, and support vector regression (SVR). SVR had the highest accuracy, and this algorithm was chosen for our final model.
+
+## Data preprocessing
+
+Our final prediction model would output three predictions – a binary prediction detailing if the kidney was experiencing acute rejection or was stable, a CADI score, and an i-IFTA score.
+
+For the binary prediction model, two datasets were chosen from the Gene Expression Omnibus (GEO) database - GSE26578 (Mao, 2011) and GSE14328 (Chen, et al., 2010). Batch correction was performed on these two datasets using sva’s `ComBat` function (Leek, et al., 2022) to eliminate variation due to technical or experimental factors and preserve biological variation. The method of batch correction used was non-parametric adjustment, mean-only version.
+
+```{r fig.cap="Principal Component Analysis demonstrating the effects of batch correction on 149 patient gene expression values."}
+# PCA demonstrating how batch correction affected our data
+before_pca = prcomp(t(exprs(combined_gse)))
+before_toplot = data.frame(combined_gse$batch, pc1 = before_pca$x[, 1], pc2 = before_pca$x[, 2])
+p1 = ggplot(before_toplot, aes(x = pc1, y = pc2, color = combined_gse$batch)) + geom_point(size = 3, shape = 18) + theme_minimal() +
+  labs(x = "PC1", y = "PC2", title = "Before batch correction") + scale_color_discrete(name = "Batch")
+
+after_pca = prcomp(t(exprs(corrected_gse)))
+after_toplot = data.frame(corrected_gse$batch, pc1 = after_pca$x[, 1], pc2 = after_pca$x[, 2])
+p2 = ggplot(after_toplot, aes(x = pc1, y = pc2, color = corrected_gse$batch)) + geom_point(size = 3, shape = 18) + theme_minimal() +
+  labs(x = "PC1", y = "PC2", title = "After batch correction") + scale_color_discrete(name = "Batch")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+
+For the CADI and i-FTA prediction models, the data was normalised using log base 2 normalisation. This allowed us to focus on proportional or relative expression levels between genes, which allowed us to deliver more accurate predictions.
+
+## Model Development
+
+For our kNN binary model, hyperparameters were chosen through testing accuracy for different values of k within a cross-validation (CV) framework. CV was performed with 5 folds for 50 repeats, with values of k ranging from 1 to 50. Optimal accuracy was achieved with $k = 1$, and this parameter was used for our final prediction model.
+
+```{r fig.cap="Hyperparameter selection for knn-nearest neighbours model."}
+# insert the k testing graph here
+calc_cv_acc <- function(X, y, cvK, n_sim) {
+  cv_acc_knn <- array(0, dim = c(n_sim, 50))
+  cv_ba_knn <- array(0, dim = c(n_sim, 50))  # for balanced accuracy
+
+  for (i in 1:n_sim) {
+    cvSets <- cvTools::cvFolds(nrow(X), cvK)
+    cv_acc <- matrix(0, nrow = cvK, ncol = 50)
+    cv_ba <- matrix(0, nrow = cvK, ncol = 50)  # for balanced accuracy
+
+    for (j in 1:cvK) {
+      test_id <- cvSets$subsets[cvSets$which == j]
+      X_test <- X[test_id, ]
+      X_train <- X[-test_id, ]
+      y_test <- y[test_id]
+      y_train <- y[-test_id]
+      
+      design = model.matrix(~y_train)
+      fit = lmFit(t(X_train), design)
+      fit = eBayes(fit)
+      top = topTable(fit, n = Inf)
+      top = top %>% filter(adj.P.Val < 0.05)
+      DE_genes = rownames(top)
+      
+      X_train = X_train[, DE_genes]
+      X_test = X_test[, DE_genes]
+
+      for (kn in 1:50) {
+        fit = class::knn(train = X_train, test = X_test, cl = y_train, k = kn)
+        cv_acc[j, kn] <- mean(fit == y_test)
+        
+        num_positives = sum(fit == "acute rejection")
+        num_negatives = sum(fit == "stable transplant")
+    
+        sensitivity = sum(fit == "acute rejection" & y_test == "acute rejection")/num_positives
+        specificity = sum(fit == "stable transplant" & y_test == "stable transplant")/num_negatives
+        balanced_acc = (sensitivity + specificity)/2
+
+        cv_ba[j, kn] <- balanced_acc
+      }
+    }
+    cv_acc_knn[i, ] <- colMeans(cv_acc)  # take mean across folds
+    cv_ba_knn[i, ] <- colMeans(cv_ba)  # take mean across folds for balanced accuracy
+  }
+
+  list(acc = cv_acc_knn, ba = cv_ba_knn)  # return both accuracy and balanced accuracy arrays
+}
+# First, let's assume you have some data X and labels y, number of folds cvK and number of simulations n_sim
+X <- t(exprs(corrected_gse))
+y <- corrected_gse$graft_status
+
+# Run the calc_cv_acc function
+result <- calc_cv_acc(X, y, 5, 50)
+
+acc_df <- as.data.frame(result$acc)
+names(acc_df) <- paste("k =", 1:50)
+
+ba_df <- as.data.frame(result$ba)
+names(ba_df) <- paste("k =", 1:50)
+
+# Convert data from wide to long format
+acc_long <- reshape2::melt(acc_df)
+ba_long <- reshape2::melt(ba_df)
+
+# Generate boxplot for accuracy
+p_acc <- ggplot(acc_long, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "k", y = "Accuracy", title = "Overall Accuracy for different k")
+
+# Generate boxplot for balanced accuracy
+p_ba <- ggplot(ba_long, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "k", y = "Balanced Accuracy", title = "Balanced Accuracy for different k")
+
+gridExtra::grid.arrange(p_acc, p_ba, ncol = 2)
+```
+
+
+For all three models, differentially expressed (DE) genes were identified using the `lmFit` function from the `limma` package (Ritchie, et al., 2015). This method allowed us to account for multiple testing. For the binary prediction model, 410 of the DE genes were used to perform the prediction. This number was chosen since our two batch corrected datasets had 410 genes in common. For our CADI and i-IFTA models, the top 500 DE genes were used to perform the prediction.
+
+## Model Evaluation
+
+For all three models, CV was performed with 5 folds over 50 repeats to test performance and generalisation ability. CV was performed manually for the kNN prediction model and DE genes were identified within the CV loop for only the training dataset, before testing for accuracy on the testing dataset. Feature selection inside the CV was done to avoid data leakage and helped us calculate an unbiased measure of model performance. It also ensured that our model was blind to the testing data and prevented overfitting, thus creating a more robust model.
+
+Accuracy, balanced accuracy, sensitivity, and specificity were used to evaluate performance for the kNN prediction model. Sensitivity and balanced accuracy were our most important metrics, since our priority was to maximise the number of true positives and correctly predict when a person was experiencing acute rejection.
+
+CV for the CADI and i-IFTA models was performed using the train function from the caret package (Kunh, 2022) with 5 folds and 50 repeats. For each of the CADI and IFTA models, three evaluation metrics were used – Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and $R^2$. MAE provides a good measure of how different our predicted score is from the actual score on average. RMSE was used as a second measure of error and allowed us to give greater weightage to larger errors. If the RMSE was high, it would suggest that our model is performing poorly, and that the differences between the predicted value and the actual value were large. $R^2$ was used to estimate how well our model could capture the relationship between the DE genes and the CADI/i-IFTA scores.
+
+# Results
+
+For the binary prediction model, the k-nearest neighbours (kNN) method emerged as being the most effective prediction algorithm. With $k$ selected as 1, kNN was able to provide an exceptional balanced accuracy of 97%, with a sensitivity of 96% and a specificity of 98%. Our selection of the kNN model was not made at random; rather, it was predicated on multiple evaluation metrics, including accuracy, balanced accuracy, sensitivity, and specificity. Our model's great sensitivity helped us achieve our goal of maximising the number of true positives and thus accurately predicting the outcomes of acute rejection scenarios.
+
+Support Vector Regression (SVR) was chosen for the purpose of score prediction in both the CADI and i-IFTA tests due to its high accuracy. Metrics such as Mean Absolute Error (MAE), Root Mean Squared Error (RMSE), and $R^2$ were used in order to assess the accuracy of these models' predictions. MAE values were satisfactory low, indicating that there was only a slight departure from the real scores. Additionally, MAE is an easily interpretable value, one that doctors can take into account when delivering the outcome to patients. 
+
+For our i-IFTA model, the RMSE was roughly 1.15 times the mean i-IFTA score, which suggests that the i-IFTA model’s performance is relatively poor. However, for our CADI model, the RMSE was roughly 0.73 times the mean CADI score, which suggests better performance. Our i-IFTA model showed an $R^2$ value of 0.21, which suggests that 21% of the variation in the data was explained by our model. This low $R^2$ could be a contributing factor to our high RMSE. Our CADI model showed an R squared of 37%.
+
+```{r fig.cap="Accuracy metrics on binary model, i-ifta score and cadi score."}
+# insert a graph of our evaluation metrics here
+folds = 5
+repeats = 50
+
+cv_binary = c()
+se = c()
+sp = c()
+balanced_accs = c()
+
+for (i in 1:repeats) {
+  cvSets = cvFolds(nrow(pData(gse26)), folds)
+  cv_each = c()
+  sensitivities = c()
+  specificities = c()
+  balanced_acc = c()
+  
+  for (j in 1:folds) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_train = t(exprs(corrected_gse))[-test_id, ]
+    X_test = t(exprs(corrected_gse))[test_id, ]
+    y_train = corrected_gse$graft_status[-test_id]
+    y_test = corrected_gse$graft_status[test_id]
+    
+    design = model.matrix(~y_train)
+    fit = lmFit(t(X_train), design)
+    fit = eBayes(fit)
+    top = topTable(fit, n = Inf)
+    top = top %>% filter(adj.P.Val < 0.05)
+    DE_genes = rownames(top)
+    
+    X_train = X_train[, DE_genes]
+    X_test = X_test[, DE_genes]
+    
+    knn_fit = class::knn(train = X_train, test = X_test, cl = y_train, k = 1)
+    cv_each[j] = mean(knn_fit == y_test)
+    
+    num_positives = sum(knn_fit == "acute rejection")
+    num_negatives = sum(knn_fit == "stable transplant")
+    
+    sensitivities[j] = sum(knn_fit == "acute rejection" & y_test == "acute rejection")/num_positives
+    specificities[j] = sum(knn_fit == "stable transplant" & y_test == "stable transplant")/num_negatives
+    balanced_acc[j] = (sensitivities[j] + specificities[j])/2
+  }
+  cv_binary = append(cv_binary, mean(cv_each))
+  se = append(se, mean(sensitivities))
+  sp = append(sp, mean(specificities))
+  balanced_accs = append(balanced_accs, mean(balanced_acc))
+}
+
+# store cv accuracies to make boxplots
+cv_binary_metrics = cbind(cv_binary, se, sp, balanced_accs)
+
+ifta = gse25$`i-ifta grade:ch1` %>% as.factor()
+design = model.matrix(~0 + ifta)
+fit = lmFit(exprs(gse25), design)
+fit = eBayes(fit)
+tT = topTable(fit, number = Inf)
+tT = tT %>% filter(adj.P.Val < 0.05) 
+top_genes_ifta = rownames(tT[1:500, ])
+
+# filter exprs to get top 500 genes
+gse25_exprs = exprs(gse25) %>% as.data.frame()
+gse25_exprs$geneID = rownames(exprs(gse25))
+gse25_top500 = gse25_exprs %>% filter(geneID %in% top_genes_ifta)
+
+# format exprs for SVM + CV
+training_data = gse25_top500 %>% t() %>% as.data.frame()
+training_data = training_data[1:120, ]
+
+# convert all exprs values to numeric
+training_data = apply(training_data, 2, as.numeric) %>% as.data.frame()
+
+# removing one row as a demo
+test_row = sample(nrow(training_data), 1)
+test = training_data[test_row, ]
+write.csv(test, "test_ifta.csv")
+
+# normalisation
+training_data = log2(training_data + 1)
+training_data = apply(training_data, 2, function(x) {
+  (x - mean(x))/sd(x)
+})
+training_data = data.frame(training_data, row.names = row.names(training_data))
+
+training_data$ifta = as.numeric(ifta)
+
+ctrl = trainControl(method = "repeatedcv", number = 5, repeats = 50)
+model = train(ifta ~ ., data = training_data, method = "svmRadial", trControl = ctrl)
+res = model$resample
+
+model = model$finalModel
+ifta_acc = data.frame(mae = res$MAE, rmse = res$RMSE, rsquared = res$Rsquared)
+
+# finding the top DE genes
+cadi = gse25$`cadi score:ch1` %>% as.factor()
+design = model.matrix(~0 + cadi)
+fit = lmFit(exprs(gse25), design)
+fit = eBayes(fit)
+tT = topTable(fit, number = Inf)
+tT = tT %>% filter(adj.P.Val < 0.05) 
+top_genes_cadi = rownames(tT[1:500, ])
+
+# filter exprs to get top 500 genes
+gse25_exprs = exprs(gse25) %>% as.data.frame()
+gse25_exprs$geneID = rownames(exprs(gse25))
+gse25_top500 = gse25_exprs %>% filter(geneID %in% top_genes_cadi)
+
+# format exprs for SVM + CV
+training_data = gse25_top500 %>% t() %>% as.data.frame()
+training_data = training_data[1:120, ]
+
+# convert all exprs values to numeric
+training_data = apply(training_data, 2, as.numeric) %>% as.data.frame()
+
+
+# removing one row as a demo
+test_row = sample(nrow(training_data), 1)
+test = training_data[test_row, ]
+write.csv(test, "test_cadi.csv")
+
+# normalisation
+training_data = log2(training_data + 1)
+training_data = apply(training_data, 2, function(x) {
+  (x - mean(x))/sd(x)
+})
+training_data = data.frame(training_data, row.names = row.names(training_data))
+
+training_data$cadi = as.numeric(cadi)
+
+
+ctrl = trainControl(method = "repeatedcv", number = 5, repeats = 50)
+model = train(cadi ~ ., data = training_data, method = "svmRadial", trControl = ctrl)
+res = model$resample
+
+model = model$finalModel
+
+# save MAE to a file so we can make boxplot
+cadi_acc = data.frame(mae = res$MAE, rmse = res$RMSE, rsquared = res$Rsquared)
+
+# Load required library
+library(ggplot2)
+
+# Convert matrices to data frames
+cv_binary_metrics_df <- as.data.frame(cv_binary_metrics)
+ifta_acc_df <- as.data.frame(ifta_acc)
+cadi_acc_df <- as.data.frame(cadi_acc)
+
+# Convert data frames into long format for ggplot
+cv_binary_metrics_long <- tidyr::pivot_longer(cv_binary_metrics_df, everything())
+ifta_acc_long <- tidyr::pivot_longer(ifta_acc_df, everything())
+cadi_acc_long <- tidyr::pivot_longer(cadi_acc_df, everything())
+
+# Create the boxplots
+p1 <- ggplot(cv_binary_metrics_long, aes(x=name, y=value)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(x="Metrics", y="Accuracy", title="CV Binary Metrics")
+
+p2 <- ggplot(ifta_acc_long, aes(x=name, y=value)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(x="Metrics", y="Values", title="IFTA Accuracy")
+
+p3 <- ggplot(cadi_acc_long, aes(x=name, y=value)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(x="Metrics", y="Values", title="CADI Accuracy")
+
+# If you want to display the boxplots in the same graphics device
+library(gridExtra)
+grid.arrange(p1, p2, p3, ncol=3)
+
+
+```
+
+
+Following the completion of model development and evaluation, we started the process of model deployment. Our model was implemented as a Shiny application that can predict kidney graft survival post transplant. Shiny is an open-source framework that allows developers to create interactive online applications. The application receives gene expression data as its input and then uses our selected models to provide three outcomes - a binary prediction of ‘Acute rejection’ or ‘Stable transplant’ for the kidney, the CADI score, and the i-IFTA score. The three predictions, taken together, can be used to inform post-transplant care. The simple and straightforward interface makes it convenient for doctors to discuss the results with their patients.
+
+Our app also provides information on all the evaluation metrics used for the model, which doctors can peruse at their leisure. Our definitions and explanations are context-specific, making it easy for doctors to focus on the relevant medical details rather than the mathematical or data-centric aspects.
+
+![Figure 2. Shiny app demo](shiny.png)
+
+
+Ultimately, we were able to properly utilise principles from both the domains of biology and data science to create a product that can help doctors and kidney transplant patients understand the state of the kidney and explore alternative treatment options. Understanding the basis of kidney transplant rejection and the relevance of the i-IFTA and CADI scores required an understanding of the underlying biology. Our understanding and knowledge of data science concepts helped us translate the biological information into interpretable forecasts. This can be demonstrated through our Shiny app, which serves as a testament to the successful interdisciplinary teamwork that led to its development. 
+
+To summarise, the findings of this experiment verify our methodology and highlight the potential of utilising gene expression data to forecast the status of the recipient's kidneys after transplantation. Because our models have been included into a Shiny application, medical decision-makers now have access to a tool that is not only functional but also intuitive and easy to use.
+
+# Discussion
+
+Although our app has great potential in assisting doctors and patients in post-transplant care, there are potential limitations to its applications. All of our source datasets used microarrays to measure gene expression levels, which are sensitive to biological variation in individual mRNA samples (Hatfield, et al., 2003). Technical and experimental variation can also create a lot of noise in the dataset, although this was eliminated to a large extent using batch correction.
+
+Additionally, CADI and i-IFTA scores were present in only one dataset, which provided us with a limited sample and also restricted our ability to test for robustness and generalisability. In the future, we would incorporate more datasets with these scores so we can build a more robust model. The CADI score also ranged from 0-10 within this dataset, which heavily restricted the ability of our model to predict the score for patients with high chronic damage.
+
+We were also interested in conducting survival analysis to evaluate long term rejection, as Hariharan (2021) did in his study, from 2 years – 10 years. However, we did not have access to time data. Given the opportunity, we would be interested in exploring this as we would like to go beyond a simple binary prediction and provide a timeline of rejection for 5-10 years. It would also be interesting to explore pre-transplant data and compare it to post-transplant data, to see if we can build a model of prediction to be used before the transplant has occurred.
+
+Our project can make a major contribution to identifying biomarkers that are associated with kidney transplant rejection, which is an active area of research. The DE genes we have identified could be studied for their connection to transplant rejection to uncover the molecular mechanisms behind the process, as many groundbreaking studies are doing today (Bi, et al., 2023). This would include identifying biomarkers not only associated with acute rejection, but with long-term graft function as well. 
+
+# Conclusion
+
+Our final product is a patient-focused, intuitive and easy to use interface that will assist doctors in delivering kidney transplant outcomes to patients in the few weeks after the transplant. The binary rejection is our key outcome, with the CADI and i-IFTA scores providing further information about the level of inflammation and the rejection timeline. Using a variety of evaluation metrics, we achieved a balanced accuracy of 97% for our binary prediction model. This showcases the potential of gene expression data in predicting the outcome of kidney transplants, and also identifies DE genes that could be linked to specific outcomes. This would allow doctors and clinicians to intervene in a timely manner and adjust treatment methods to improve graft survival rates and better long-term outcomes. Our model is merely a starting point in solving the kidney crisis and we hope to continue future research by accessing more time based and relevant data.  
+
+# Student Contributions
+
+Owen and Eddie were the main contributors to the Shiny App.
+
+Owen built the binary model at the first glance and decided to use k=1 as a hyperparameter to the binary predictor.
+
+Shreya led the team, performed batch corrections, and built the binary, CADI and i-IFTA models. She also prepared some slides for the presentation and wrote the methods section for the report.
+
+Eeshan managed the evaluation metrics and dataset integration. Additionally, constructed an initial binary prediction model. He looked into more prediction methods for CADI and i-IFTA models, and developed the Model Info tab for a Shiny app. He also contributed to a few presentation slides and the report's result section.
+
+Nida formulated the presentation and report and conducted the initial data exploration and model building. She contributed by looking into various datasets from the GSE database to look for things such as rejection data, time series data, other interesting factors such as age, sex. She formulated the initial binary models via model comparison of kNN, SVM and random forest. 
+
+Jacqueline played a crucial role in data preprocessing, as well as in the creation of slides and workflow diagrams. She also made significant contributions to editing and refining the report.
+
+
+# References
+
+Australian Institute of Health and Welfare. (2023). Chronic kidney disease: Australian facts. Retrieved from https://www.aihw.gov.au/reports/chronic-kidney-disease/chronic-kidney-disease
+
+Bi, Q. et al., 2023. Identification of potential necroinflammation-associated necroptosis-related biomarkers for delayed graft function and renal allograft failure: a machine learning-based exploration in the framework of predictive, preventive, and personalized medicine. EPMA Journal.
+
+Chen, R. et al., 2010. Three non-invasive protein biomarkers for solid-organ transplant rejection found through integrative genomics. PLoS Computational Biology, 6(9).
+
+Halloran, P. F. (2004). Immunosuppressive drugs for kidney transplantation. New England Journal of Medicine, 351(26), 2715-2729.
+
+Hariharan, S., Israni, A. K., & Danovitch, G. (2021). Long-term survival after kidney transplantation. New England Journal of Medicine, 385(8), 729-743.
+
+Hatfield, G. W., Hung, S. & Baldi, P., 2003. Differential analysis of DNA microarray gene expression data. Molecular Microbiology, 47(4), pp. 871-877.
+
+Huber, W., Carey, V. J., Gentleman, R. & Morgan, M., 2015. Orchestrating high-throughput genomic analysis with Bioconductor. Nature Methods, 12(2), pp. 115-121.
+
+Leek, J. T. et al., 2022. sva: Surrogate Variable Analysis. R package version 3.46.0, s.l.: s.n.
+
+Liaw, A. & Wiener, M., 2002. Classification and Regression by randomForest. R News, 2(3), pp. 18-22.
+
+Mao, Y., 2011. Renal allograft dysfunction (kidney tissue data set). Gene Expression Omnibus.
+
+Meyer, D. et al., 2023. e1071: Misc Functions of the Department of Statistics. R package version 1.7-13. s.l.:https://CRAN.R-project.org/package=e1071.
+
+Naesens, M. et al., 2011. Progressive histological damage in renal allografts is associated with expression of innate and adaptive immunity genes. Kidney International, 80(12), pp. 1364-1376.
+
+R Core Team, 2022. R: A language and environment for statistical computing, Vienna, Austria: R Foundation for Statistical Computing.
+
+Ritchie, M. E. et al., 2015. limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Research, 43(7), p. e47.
+
+Venables, M. N. & Ripley, B. D., 2002. Modern Applied Statistics with S. Fourth ed. New York: Springer.
+
+# Appendix
+
+## Section I. Data preprocessing and batch correction
+
+```{r eval = FALSE}
+library(GEOquery)
+library(dplyr)
+library(stringr)
+library(sva)
+library(Biobase)
+library(caret)
+library(cvTools)
+
+setwd("C:/Users/shrey/Desktop/DATA3888/appfiles/")
+set.seed(1)
+
+# ------------------------------------- BATCH CORRECTION -----------------------
+# our primary dataset for binary model
+gse26 = getGEO("GSE26578")
+gse26 = gse26$GSE26578_series_matrix.txt.gz
+
+# our secondary dataset for batch correction
+gse14 = getGEO("GSE14328")
+gse14 = gse14$GSE14328_series_matrix.txt.gz
+
+# 411 common genes
+length(intersect(fData(gse26)$`Gene`, fData(gse14)$`Gene Symbol`))
+
+# prepping pData for combining
+# introduce a new column called graft_status with binary outcomes for gse26
+gse26_pData = pData(gse26) %>% 
+  mutate(graft_status = case_when(str_detect(pData(gse26)$`disease status:ch1`, fixed("stable")) ~ "stable transplant",
+                                  str_detect(pData(gse26)$`disease status:ch1`, fixed("acute")) ~ "acute rejection",
+                                  str_detect(pData(gse26)$`disease status:ch1`, fixed("dysfunction")) ~ "acute rejection"))
+
+
+# manually adding batch
+gse26_pData$batch = rep("A", nrow(gse26_pData))
+gse26_pData = gse26_pData %>% select(c(geo_accession, graft_status, batch))
+
+# prepping fData data for combining
+common_genes = intersect(fData(gse26)$`Gene`, fData(gse14)$`Gene Symbol`)
+gse26_index = fData(gse26) %>% filter(`Gene` %in% common_genes)
+
+# for fData, we take only the first uniquely occurring gene - this gives us the 411 common genes 
+gse26_unique = gse26_index %>% group_by(`Gene`) %>% slice_head(n = 1)
+gse26_fData = gse26_unique %>% mutate(ID = substring(ID, 1, 5))
+gse26_fData = gse26_fData %>% select(c(ID, Gene, GB_ACC, GeneDes))
+gse26_unique_index = gse26_fData$ID
+
+# prepping exprs for combining
+# taking aggregrate of the non-unique gene exprs
+gse26_exprs = exprs(gse26) %>% as.data.frame()
+gse26_exprs$full_geneID = rownames(gse26_exprs)
+gse26_exprs_grouped = gse26_exprs %>% mutate(geneID = substring(full_geneID, 1, 5)) %>% select(-full_geneID)
+gse26_exprs_grouped = gse26_exprs_grouped %>% group_by(geneID) %>% summarise_all(mean)
+gse26_exprs_grouped = gse26_exprs_grouped %>% filter(geneID %in% gse26_unique_index) %>% as.data.frame()
+rownames(gse26_exprs_grouped) = gse26_exprs_grouped$geneID
+gse26_exprs_grouped = gse26_exprs_grouped %>% select(-geneID)
+
+# for gse26, fData = gse26_fData, pData = gse26_pData, exprs = gse26_exprs_grouped
+
+# same thing for gse14
+# prepping pData for combining
+gse14_pData = pData(gse14) %>%
+  mutate(graft_status = case_when(str_detect(pData(gse14)$`characteristics_ch1`, fixed("stable")) ~ "stable transplant",
+                                  str_detect(pData(gse14)$`characteristics_ch1`, fixed("acute")) ~ "acute rejection"))
+
+# manually adding batch
+gse14_pData$batch = rep("B", nrow(gse14_pData))
+gse14_pData$geo_accession = rownames(gse14_pData)
+gse14_pData = gse14_pData %>% select(c(geo_accession, graft_status, batch))
+
+# prepping fData for combining
+gse14_index = fData(gse14) %>% filter(`Gene Symbol` %in% common_genes)
+
+# for fData, we take only the first uniquely occurring gene - this gives us the 411 common genes 
+gse14_unique = gse14_index %>% group_by(`Gene Symbol`) %>% slice_head(n = 1)
+gse14_fData = gse14_unique %>% select(c(ID, `Gene Symbol`, GB_ACC, `Gene Title`))
+gse14_unique_index = gse14_unique$ID
+
+# prepping exprs for combining 
+# taking aggregate of the non-unique exprs
+gse14_exprs = exprs(gse14) %>% as.data.frame()
+gse14_exprs$geneID = rownames(gse14_exprs) 
+gse14_exprs = gse14_exprs %>% filter(geneID %in% gse14_unique_index) %>% select(-geneID)
+
+# for gse14, pData = gse14_pData, fData = gse14_fData, exprs = gse14_exprs
+
+# combining
+combined_pData = rbind(gse26_pData, gse14_pData)
+combined_fData = gse26_fData %>% as.data.frame()
+combined_exprs = cbind(gse26_exprs_grouped, gse14_exprs)
+
+# building ExpressionSet object
+combined_pData = AnnotatedDataFrame(data = combined_pData)
+combined_gse = ExpressionSet(assayData = as.matrix(combined_exprs), phenoData = combined_pData, fData = combined_fData)
+fData(combined_gse) = combined_fData
+
+# batch correction
+pheno = pData(combined_gse)
+edata = exprs(combined_gse)
+batch = pheno$batch
+mod = model.matrix(~as.factor(graft_status), data = pheno)
+
+# non-parametric adjustment, mean-only version
+combat = sva::ComBat(dat = edata, batch = batch, mod = NULL, par.prior = FALSE, mean.only = TRUE)
+corrected_gse = ExpressionSet(assayData = as.matrix(combat), phenoData = combined_pData)
+fData(corrected_gse) = combined_fData
+
+# removing the one NaN row from exprs
+exprs_df = exprs(corrected_gse) %>% as.data.frame()
+df_without_na = exprs_df[complete.cases(exprs_df), ]
+
+fData_without_na = filter(fData(corrected_gse), ID != "ZH354")
+
+corrected_gse = ExpressionSet(assayData = as.matrix(df_without_na), phenoData = combined_pData)
+fData(corrected_gse) = fData_without_na
+
+```
+
+## Section II. Binary model development and evaluation metrics
+
+```{r eval = F}
+folds = 5
+repeats = 50
+
+cv_binary = c()
+se = c()
+sp = c()
+balanced_accs = c()
+
+for (i in 1:repeats) {
+  cvSets = cvFolds(nrow(pData(gse26)), folds)
+  cv_each = c()
+  sensitivities = c()
+  specificities = c()
+  balanced_acc = c()
+  
+  for (j in 1:folds) {
+    test_id = cvSets$subsets[cvSets$which == j]
+    X_train = t(exprs(corrected_gse))[-test_id, ]
+    X_test = t(exprs(corrected_gse))[test_id, ]
+    y_train = corrected_gse$graft_status[-test_id]
+    y_test = corrected_gse$graft_status[test_id]
+    
+    design = model.matrix(~y_train)
+    fit = lmFit(t(X_train), design)
+    fit = eBayes(fit)
+    top = topTable(fit, n = Inf)
+    top = top %>% filter(adj.P.Val < 0.05)
+    DE_genes = rownames(top)
+    
+    X_train = X_train[, DE_genes]
+    X_test = X_test[, DE_genes]
+    
+    knn_fit = class::knn(train = X_train, test = X_test, cl = y_train, k = 1)
+    cv_each[j] = mean(knn_fit == y_test)
+    
+    num_positives = sum(knn_fit == "acute rejection")
+    num_negatives = sum(knn_fit == "stable transplant")
+    
+    sensitivities[j] = sum(knn_fit == "acute rejection" & y_test == "acute rejection")/num_positives
+    specificities[j] = sum(knn_fit == "stable transplant" & y_test == "stable transplant")/num_negatives
+    balanced_acc[j] = (sensitivities[j] + specificities[j])/2
+  }
+  cv_binary = append(cv_binary, mean(cv_each))
+  se = append(se, mean(sensitivities))
+  sp = append(sp, mean(specificities))
+  balanced_accs = append(balanced_accs, mean(balanced_acc))
+}
+
+# store cv accuracies to make boxplots
+cv_binary_metrics = cbind(cv_binary, se, sp, balanced_accs)
+cv_binary_metrics %>% write.csv("cv_binary_metrics.csv")
+
+# store the model input data
+model_data = exprs(corrected_gse) %>% t() %>% as.data.frame()
+knn_model = list(train_data = model_data, cl = corrected_gse$graft_status, k = 1)
+saveRDS(knn_model, file = "binary_model.rds")
+```
+
+## Section III. i-IFTA model development and evaluation metrics
+
+```{r eval = F}
+gse25 = getGEO("GSE25902")
+gse25 = gse25$GSE25902_series_matrix.txt.gz
+
+# finding the top DE genes
+ifta = gse25$`i-ifta grade:ch1` %>% as.factor()
+design = model.matrix(~0 + ifta)
+fit = lmFit(exprs(gse25), design)
+fit = eBayes(fit)
+tT = topTable(fit, number = Inf)
+tT = tT %>% filter(adj.P.Val < 0.05) 
+top_genes_ifta = rownames(tT[1:500, ])
+
+# filter exprs to get top 500 genes
+gse25_exprs = exprs(gse25) %>% as.data.frame()
+gse25_exprs$geneID = rownames(exprs(gse25))
+gse25_top500 = gse25_exprs %>% filter(geneID %in% top_genes_ifta)
+
+# format exprs for SVM + CV
+training_data = gse25_top500 %>% t() %>% as.data.frame()
+training_data = training_data[1:120, ]
+
+# convert all exprs values to numeric
+training_data = apply(training_data, 2, as.numeric) %>% as.data.frame()
+
+# normalisation
+training_data = log2(training_data + 1)
+training_data = apply(training_data, 2, function(x) {
+  (x - mean(x))/sd(x)
+})
+training_data = data.frame(training_data, row.names = row.names(training_data))
+
+# removing one row as a demo
+test_row = sample(nrow(training_data), 2)
+test = training_data[test_row, ]
+write.csv(test[1, ], "testfiles/iftatest_1.csv", row.names = FALSE)
+write.csv(test[2, ], "testfiles/ifta_test2.csv", row.names = FALSE)
+
+training_data$ifta = as.numeric(ifta)
+
+ctrl = trainControl(method = "repeatedcv", number = 5, repeats = 50)
+model = train(ifta ~ ., data = training_data, method = "svmRadial", trControl = ctrl)
+res = model$resample
+
+model = model$finalModel
+
+# save the model as a .RDS file
+saveRDS(model, file = "ifta_model.rds")
+
+# save metrics to a file so we can make boxplot
+ifta_acc = data.frame(mae = res$MAE, rmse = res$RMSE, rsquared = res$Rsquared)
+ifta_acc %>% write.csv("cv_ifta.csv")
+
+```
+
+## Section IV. CADI model development and evaluation metrics
+
+```{r eval = F}
+# finding the top DE genes
+cadi = gse25$`cadi score:ch1` %>% as.factor()
+design = model.matrix(~0 + cadi)
+fit = lmFit(exprs(gse25), design)
+fit = eBayes(fit)
+tT = topTable(fit, number = Inf)
+tT = tT %>% filter(adj.P.Val < 0.05) 
+top_genes_cadi = rownames(tT[1:500, ])
+
+# filter exprs to get top 500 genes
+gse25_exprs = exprs(gse25) %>% as.data.frame()
+gse25_exprs$geneID = rownames(exprs(gse25))
+gse25_top500 = gse25_exprs %>% filter(geneID %in% top_genes_cadi)
+
+# format exprs for SVM + CV
+training_data = gse25_top500 %>% t() %>% as.data.frame()
+training_data = training_data[1:120, ]
+
+# convert all exprs values to numeric
+training_data = apply(training_data, 2, as.numeric) %>% as.data.frame()
+
+# normalisation
+training_data = log2(training_data + 1)
+training_data = apply(training_data, 2, function(x) {
+  (x - mean(x))/sd(x)
+})
+training_data = data.frame(training_data, row.names = row.names(training_data))
+
+# removing one row as a demo
+test_row = sample(nrow(training_data), 2)
+test = training_data[test_row, ]
+write.csv(test[1, ], "testfiles/cadi_test1.csv", row.names = FALSE)
+write.csv(test[2, ], "testfiles/cadi_test2.csv", row.names = FALSE)
+
+training_data$cadi = as.numeric(cadi)
+
+
+ctrl = trainControl(method = "repeatedcv", number = 5, repeats = 50)
+model = train(cadi ~ ., data = training_data, method = "svmRadial", trControl = ctrl)
+res = model$resample
+
+model = model$finalModel
+
+# save the model as a .RDS file
+saveRDS(model, file = "cadi_model.rds")
+
+# save MAE to a file so we can make boxplot
+cadi_acc = data.frame(mae = res$MAE, rmse = res$RMSE, rsquared = res$Rsquared)
+cadi_acc %>% write.csv("cv_cadi.csv")
+```
+
+## Section V. Compiling the list of genes needed for each model 
+
+```{r eval = F}
+binary_genes = fData(corrected_gse)
+ifta_genes = fData(gse25) %>% filter(ID %in% top_genes_ifta)
+cadi_genes = fData(gse25) %>% filter(ID %in% top_genes_cadi)
+
+ifta_genes = ifta_genes %>% select(c(`ID`, `Gene Symbol`, `GB_ACC`, `Gene Ontology Molecular Function`)) %>% 
+  rename(Gene = `Gene Symbol`, GeneDes = `Gene Ontology Molecular Function`)
+
+cadi_genes = cadi_genes %>% select(c(ID, `Gene Symbol`, GB_ACC, `Gene Ontology Molecular Function`)) %>% 
+  rename(Gene  = `Gene Symbol`, GeneDes = `Gene Ontology Molecular Function`)
+
+binary_genes %>% write.csv("binary_genes.csv")
+cadi_genes %>% write.csv("cadi_genes.csv")
+ifta_genes %>% write.csv("ifta_genes.csv")
+```
+
+## Section VI. Developing template files for each model that doctors can follow
+
+```{r eval = F}
+# --------------------------- TEMPLATE FOR BINARY MODEL -------------------------------
+col_names = fData_without_na$Gene
+
+# Sample list of column names
+columnNames <- c(col_names)
+
+# Create a data frame with empty rows
+dataFrame <- data.frame(matrix(ncol = length(columnNames), nrow = 0))
+colnames(dataFrame) <- columnNames
+
+# Save the data frame to a CSV file
+write.csv(dataFrame, file = "column_names.csv", row.names = FALSE)
+
+data <- read.csv("column_names.csv")
+
+# Create a blank row with the same number of columns as the original data
+blank_row <- data.frame(matrix(ncol = ncol(data), nrow = 1))
+colnames(blank_row) <- colnames(data)
+
+# Append the blank row to the data
+data <- rbind(data, blank_row)
+
+# Save the updated data back to the CSV file, overwriting the original content
+write.csv(data, file = "column_names.csv", row.names = FALSE)
+
+# --------------------------------- TEMPLATE FOR i-IFTA MODEL -----------------------------
+
+# extracting first gene symbol only
+ifta_genes$Gene = word(ifta_genes$Gene, 1)
+ifta_genes$Gene
+
+col_names_ifta = ifta_genes$Gene
+
+# Sample list of column names
+columnNames <- c(col_names_ifta)
+
+# Create a data frame with empty rows
+dataFrame <- data.frame(matrix(ncol = length(columnNames), nrow = 0))
+colnames(dataFrame) <- columnNames
+
+# Save the data frame to a CSV file
+write.csv(dataFrame, file = "column_names_ifta.csv", row.names = FALSE)
+
+# adding blank row -----
+data <- read.csv("column_names_ifta.csv")
+
+# Create a blank row with the same number of columns as the original data
+blank_row <- data.frame(matrix(ncol = ncol(data), nrow = 1))
+colnames(blank_row) <- colnames(data)
+
+# Append the blank row to the data
+data <- rbind(data, blank_row)
+
+# Save the updated data back to the CSV file, overwriting the original content
+write.csv(data, file = "column_names_ifta.csv", row.names = FALSE)
+
+# ---------------------------------------- TEMPLATE FOR CADI MODEL ------------------------------
+
+# extracting first gene symbol only
+cadi_genes$Gene = word(cadi_genes$Gene, 1)
+cadi_genes$Gene
+
+col_names_cadi = cadi_genes$Gene
+
+# Sample list of column names
+columnNames <- c(col_names_cadi)
+
+# Create a data frame with empty rows
+dataFrame <- data.frame(matrix(ncol = length(columnNames), nrow = 0))
+colnames(dataFrame) <- columnNames
+
+# Save the data frame to a CSV file
+write.csv(dataFrame, file = "column_names_cadi.csv", row.names = FALSE)
+
+# adding blank row -----
+data <- read.csv("column_names_cadi.csv")
+
+# Create a blank row with the same number of columns as the original data
+blank_row <- data.frame(matrix(ncol = ncol(data), nrow = 1))
+colnames(blank_row) <- colnames(data)
+
+# Append the blank row to the data
+data <- rbind(data, blank_row)
+
+# Save the updated data back to the CSV file, overwriting the original content
+write.csv(data, file = "column_names_cadi.csv", row.names = FALSE)
+```
+
+## Section VII. Shiny App source code
+```{r eval = F}
+library(GEOquery)
+library(dplyr)
+library(stringr)
+library(Biobase)
+library(caret)
+library(limma)
+library(plotly)
+library(shiny)
+library(bslib)
+library(shinydashboard)
+library(caret)
+library(kernlab)
+
+set.seed(3888)
+
+ui = dashboardPage(
+  dashboardHeader(title = "NephroPulse"),
+
+  
+  dashboardSidebar(
+    
+    sidebarMenu(
+      menuItem("Dashboard", tabName = "dashboard", icon = icon("home")),
+      menuItem("Short-term rejection", tabName = "binary", icon = icon("notes-medical")),
+      menuItem("CADI score", tabName = "cadi", icon = icon("notes-medical")),
+      menuItem("i-IFTA score", tabName = "ifta", icon = icon("notes-medical")),
+      menuItem("Our Prediction Model", tabName = "info", icon = icon("info-circle"))
+    )
+  ),
+  
+  dashboardBody(
+    tags$head(
+      tags$link(rel = "stylesheet", type = "text/css", href = "customtitle.css")
+    ),
+    
+    tags$head(tags$style(HTML("
+                              .bold-text {
+                                font-weight: bold;
+                              }"
+                              ))),
+    
+    tabItems(
+      tabItem(tabName = "dashboard",
+              h1("Dashboard"),
+              br(),
+              p("Welcome to the Kidney Transplantation Risk Calculator!"),
+              p("This app helps you predict the risk of kidney transplantation for individual patients. 
+                To use the app, you will need to upload a CSV file containing patient data."),
+              p("Once the data has been uploaded, the app will automaticaly predict the risk for that patient. Please note that the app can predict risk for only one patient at a time. Details of the structure of the .csv file required are provided in each tab."),
+              p("For more information about the model, please visit the 'Our Prediction Model' tab."),
+              br(),
+              h3("Quick Summary of Features"),
+              fluidRow(column(4,
+                              h4("Short-term rejection"),
+                              p("Our model classifies the kidney transplant as experiencing acute rejection or short-term stability based on 
+                                patient gene expression profiles.")),
+                       column(4,
+                              h4("CADI score"),
+                              p("The Chronic Allograft Damage Index (CADI) provides a measure of chronic damage that the kidney is experiencing and 
+                                can help assess long-term graft survival.")),
+                       column(4,
+                              h4("i-IFTA score"),
+                              p("The Interstitial Fibrosis and Tubular Atrophy (i-IFTA) score is a measure of inflammation or scarring in the kidney."))),
+              br(),
+              p("Each of our models requires a different set of genes to perform the prediction, the details of which are provided within .csv files wihtin each tab.
+                Please ensure that your .csv patient file contains one row representing the patient, with the columns representing the gene expression values.
+                You can find a sample patient file below."),
+              downloadLink("sample_patient", "Sample Patient File")),
+      tabItem(tabName = "binary",
+              h1("Short-term rejection"),
+              fluidRow(box(status = "primary", fileInput("binary_file", "Choose .csv file", accept = ".csv"))),
+              p("Your gene expression profile is most consistent with:"),
+              fluidRow(box(tags$div(style = "text-align: center;
+                                           font-size: 18px;
+                                           font-weight:bold", textOutput("binary_outcome")))),
+              br(),
+              p(class = "bold-text", "What does your prediction mean?"),
+              fluidRow(column(width = 5, 
+                           HTML("<p><b><i>Acute rejection</b></i> is a condition where the transplanted organ is
+                           recognized as a 'foreign' entity and gets rejected by the immune system. This can
+                                occur anytime between one week after the transplantation to 3 months after the
+                                transplantation, and is a normal immune response.")),
+                       column(width = 5,
+                              HTML("<p>If the condition of the transplant is <b><i>stable</i></b>, it is not being
+                                   actively rejected by the immune system."))),
+              br(),
+              p("You can find information on the genes required for this prediction below."),
+              downloadLink("binary_download", "Download CSV"),
+              br(),
+              p("You can also find a template file below."),
+              downloadLink("column_names_binary", "Download CSV")),
+      tabItem(tabName = "cadi",
+              h1("CADI score"),
+              fluidRow(box(status = "primary", fileInput("cadi_file", "Choose .csv file", accept = ".csv"))),
+              p("You predicted Chronic Allograft Damage Index is:"),
+              fluidRow(box(tags$div(style = "text-align: center;
+                                    font-size: 18px;
+                                    font-weight: bold", textOutput("cadi_outcome")))),
+              br(),
+              HTML("<p>The <b>Chronic Allograft Damage Index</b>, or <b>CADI score</b>, provides a measure of 
+                   chronic damage to the kidney and is closely correlated with later graft function and outcome.
+                   The score ranges from a minimum of 0 to a maximum of 18, with a higher score corresponding to
+                   a less favourable outcome for allograft status. It is calculated as a sum of
+                   six histopathological parameters:"),
+              HTML("<ul>
+                      <li>interstitial inflammation</li>
+                      <li>tubular atrophy</li>
+                      <li>interstitial fibrosis</li>
+                      <li>arterial fibrointimal thickening</li>
+                      <li>glomerular mesangial matrix increase</li>
+                      <li>percentage of globally sclerosed glomeruli</li>
+                   </ul>"),
+              br(),
+              p("You can find information on the genes required for this prediction below."),
+              downloadLink("cadi_download", "Download CSV"),
+              br(),
+              p("You can also find a template file below."),
+              downloadLink("column_names_cadi", "Download CSV"),
+              HTML("<p><b><i>Please note, this prediction is supplementary to our main short-term rejection prediction, and must be used in
+                   conjunction with it.</i></b></p>")),
+      tabItem(tabName = "ifta",
+              h1("i-IFTA score"),
+              fluidRow(box(status = "primary", fileInput("ifta_file", "Choose .csv file", accept = ".csv"))),
+              fluidRow(box(tags$div(style = "text-align: center;
+                                    font-size: 18px;
+                                    font-weight: bold", textOutput("ifta_outcome")))),
+              br(),
+              HTML("<p>The <b>I-IFTA</b> score is a measure of inflammation in the kidney and has been associated
+                   with decreased allograft survival. The score ranges from a minimum of 0 to a maximum of 3."),
+              HTML("<ul>
+                      <li><b>0: </b>no inflammation</li>
+                      <li><b>1: </b>mild inflammation</li>
+                      <li><b>2: </b>moderate inflammation</li>
+                      <li><b>3: </b>severe inflammation</li
+                   </ul>"),
+              br(),
+              p("You can find information on the genes required for this prediction below."),
+              downloadLink("ifta_download", "Download CSV"),
+              br(),
+              p("You can also find a template file below."),
+              downloadLink("column_names_ifta", "Download CSV"),
+              HTML("<p><b><i>Please note, this prediction is supplementary to our main short-term rejection prediction, and must be used in
+                   conjunction with it.</i></b></p>")),
+      tabItem(tabName = "info",
+  h1("Our Prediction Model"),
+  tabsetPanel(
+    tabPanel("Short-term Rejection Model", 
+      h2("Short-term rejection model"),
+      tabsetPanel(
+        tabPanel("Selection of k", 
+                 plotlyOutput("k_selection_cv"),
+                 plotlyOutput("k_selection_ba"),
+          HTML("<p>The model employs k-Nearest Neighbors (kNN) classification, al algorithm that works by classifying a data point based on the majority class of its 'k' nearest neighbors. The optimal 'k' of 1 for our case was determined based on specific characteristics of the data and the model's performance.")),
+        tabPanel("Balanced Accuracy & cross validation", 
+                 plotlyOutput("cv_binary_boxplot"),
+          HTML("<p>To validate the model's performance and generalize it to unseen data, it uses cross-validation (CV) with 5 folds and 50 repeats. This resampling procedure involves dividing the data into 5 subsets (folds). For each 
+repetition, the model is trained on 4 subsets and tested on the remaining one. This process is repeated 50 
+times, with each fold used as the testing set 10 times over the 50 repetitions.")),
+        tabPanel("Sensitivity",  
+                 plotlyOutput("sensitivity_binary"),
+          HTML("<p>The ability of a model to correctly predict that a patient's kidney is experiencing acute rejection, given that the patient is actually experiencing acute rejection. For our model, this measure was 0.96, which means that 96% of the time, the model can correctly identify patients experiencing acute rejection.")),
+        tabPanel("Specificity",  
+                 plotlyOutput("specificity_binary"),
+          HTML("<p>The ability of a model to correctly predict that a patient's kidney is stable, given that the patient's kidney is actually stable. For our model, this measure was 0.97, which means that 97% of the time, the model can correctly identify patients with stable kidneys."))
+      )
+    ),
+    tabPanel("CADI Score Model", 
+      h2("CADI score cross validation"),
+      tabsetPanel(
+        tabPanel("General", 
+          HTML("<p>To ensure the model's robustness and assess its performance, cross-validation (CV) with 5 folds and 50 repeats is used. In this process, the dataset is partitioned into 5 subsets. The model is then trained on 4 of 
+these subsets, and the remaining subset is used for testing. This is done 50 times, each with a different testing subset, hence 50 repeats.")),
+        tabPanel("Mean Absolute Error (MAE)",   
+                 plotlyOutput("cadi_mae_plot"),
+          HTML("<p>The average difference between the model's predicted CADI score andthe actual score. For our model, this measure was 2.21, which means that the predicted CADI score differs from the actual score by 2.21 points on average. This is the most straightforward measure of our model's accuracy")),
+        tabPanel("Root Mean Square Error (RMSE)",    
+                 plotlyOutput("cadi_rmse_plot"),
+          HTML("<p>A measure of error similar to MAE, but it penalises bigger differences between the model's predicted value and the actual value. For our model, this measure was 2.56.")),
+        tabPanel("R Squared",    
+                 plotlyOutput("cadi_rsquared_plot"),
+          HTML("<p>A measure of how well our model emulates the relationship between gene expression levels and the CADI score. The value ranges from 0 to 1, and the closer the value is to 1, the better the model
+can perform. For our model, this value was 0.36."))
+      )
+    ),
+    tabPanel("i-IFTA Score Model",
+      h2("i-IFTA score cross validation"),
+      tabsetPanel(
+        tabPanel("General", 
+          HTML("<p>To ensure the model's robustness and assess its performance, cross-validation (CV) with 5 folds and 50 repeats is used. In this process, the dataset is partitioned into 5 subsets. The model is then trained on 4 of 
+these subsets, and the remaining subset is used for testing. This is done 50 times, each with a different testing subset, hence 50 repeats.")),
+        tabPanel("Mean Absolute Error (MAE)", 
+                 plotlyOutput("ifta_mae_plot"),
+          HTML("<p>The average difference between the model's predicted i-IFTA score and the actual score. For our model, this measure was 0.68, which means that the predicted CADI score differs from the actual score by 0.68 points on average. This is the most straightforward measure of our model's accuracy.")),
+        tabPanel("Root Mean Square Error (RMSE)", 
+                 plotlyOutput("ifta_rmse_plot"),
+          HTML("<p>A measure of error similar to MAE, but it penalises bigger differences between the model's predicted value and the actual value. For our model, this measure was 0.9.")),
+        tabPanel("R Squared", 
+                 plotlyOutput("ifta_rsquared_plot"),
+          HTML("<p>A measure of how well our model emulates the relationship between gene expression levels and
+the i-IFTA score. The value ranges from 0 to 1, and the closer the value is to 1, the better the model can perform. For our model, this value was 0.21."))
+      )
+    ),
+  tabPanel("Resource", 
+          h2("Additional Resources"),
+              HTML("<p>The datasets used to train this model were all obtained from the <a href='https://www.ncbi.nlm.nih.gov/gds/'>Gene Expression Omnibus database</a>.</p>"),
+              HTML("<p>Two datasets were used to train the short-term rejection model: <a href='https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE26578'>GSE26578</a> and <a href='https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE14328'>GSE14328</a>.</p>"),
+              HTML("<p>For both the CADI and IFTA models, <a href='https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE25902'>GSE25902</a> was used.</p>")
+        )
+  )
+)
+
+
+    
+  )
+)
+)
+
+
+server = function(input, output) {
+  binary_model = readRDS("model/binary_model.rds")
+  ifta_model = readRDS("model/ifta_model.rds")
+  cadi_model = readRDS("model/cadi_model.rds")
+  
+  cv_binary_metrics = read.csv("model/cv_binary_metrics.csv")
+  cv_cadi = read.csv("model/cv_cadi.csv")
+  cv_ifta = read.csv("model/cv_ifta.csv")
+  # When reading from the CSV file
+  acc_long <- read.csv("model/acc_long.csv")
+  ba_long <- read.csv("model/ba_long.csv")
+  
+  # Converting 'variable' column into an ordered factor
+  acc_long$variable <- factor(acc_long$variable, levels = paste("k =", 1:50))
+  ba_long$variable <- factor(ba_long$variable, levels = paste("k =", 1:50))
+
+  
+  output$binary_outcome = renderText({
+    if (is.null(input$binary_file)) {
+      return("Please upload a .csv file to see results.")
+    }
+    
+    file_path = input$binary_file$datapath
+    testing_data = read.csv(file_path)
+    testing_data = testing_data[, 2:411]
+    
+    out = class::knn(train = binary_model$train_data, test = testing_data, cl = binary_model$cl, k = binary_model$k)
+    
+    paste(out)
+  })
+  
+  output$ifta_outcome = renderText({
+    if (is.null(input$ifta_file)) {
+      return("Please upload a .csv file to see results.")
+    }
+    
+    file_path = input$ifta_file$datapath
+    testing_data = read.csv(file_path)
+    testing_data = testing_data[, 2:501]
+    
+    out = round(predict(ifta_model, testing_data)[1])
+    
+    paste(out)
+  })
+  
+  output$cadi_outcome = renderText({
+    if (is.null(input$cadi_file)) {
+      return("Please upload a .csv file to see results.")
+    }
+    
+    file_path = input$cadi_file$datapath
+    testing_data = read.csv(file_path)
+    testing_data = testing_data[, 2:501]
+    
+    out = round(predict(cadi_model, testing_data)[1])
+    
+    paste(out)
+  })
+  
+  output$binary_download = downloadHandler(
+    filename = function() {
+      paste("overview/binary_genes.csv", sep = "")
+    },
+    content = function(binary_genes) {
+      file.copy("overview/binary_genes.csv", binary_genes)
+    })
+  
+  output$sample_patient = downloadHandler(
+    filename = function() {
+      paste("tests/test_binary.csv", sep = "")
+    },
+    content = function(sample_patient_file) {
+      file.copy("tests/test_binary.csv", sample_patient_file)
+    })
+  
+  output$cadi_download = downloadHandler(
+    filename = function() {
+      paste("overview/cadi_genes.csv", sep = "")
+    },
+    content = function(cadi_genes) {
+      file.copy("overview/cadi_genes.csv", cadi_genes)
+    })
+  
+  output$ifta_download = downloadHandler(
+    filename = function() {
+      paste("overview/ifta_genes.csv", sep = "")
+    },
+    content = function(ifta_genes) {
+      file.copy("overview/ifta_genes.csv", ifta_genes)
+    })
+  
+  output$cv_binary_boxplot <- renderPlotly({
+  tryCatch({
+    cv_binary_metrics_df <- as.data.frame(cv_binary_metrics)  # convert matrix to data frame
+    cv_binary_metrics_df$id <- rownames(cv_binary_metrics_df)  # add an id column
+
+    long = cv_binary_metrics_df %>%
+    select(c(id, cv_binary, balanced_accs)) %>%
+    reshape2::melt(id.vars = "id")
+
+    p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    facet_grid(~ variable, labeller = labeller(variable = c(cv_binary = "Cross Validation Accuracy", balanced_accs = "Balanced Accuracy"))) + xlab("") + 
+    ylab("Accuracy") + ggtitle("Short-term rejection prediction") + theme(plot.title = element_text(hjust = 0.5)) +
+      scale_x_discrete(labels = c()) + theme_bw() + theme(text = element_text(size = 17))
+    plotly::ggplotly(p)
+  }, error = function(e) {
+    print(as.character(e$message))
+  })
+})
+  
+  output$k_selection_cv <- renderPlotly({
+    p_acc <- ggplot(acc_long, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "k", y = "Accuracy", title = "Accuracy for different k")
+    plotly::ggplotly(p_acc)
+  })
+  
+  output$k_selection_ba <- renderPlotly({
+  p_ba <- ggplot(ba_long, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "k", y = "Balanced Accuracy", title = "Balanced Accuracy for different k")
+    plotly::ggplotly(p_ba)
+  })
+  
+  output$sensitivity_binary <- renderPlotly({
+  tryCatch({
+    cv_binary_metrics_df <- as.data.frame(cv_binary_metrics)  # convert matrix to data frame
+    cv_binary_metrics_df$id <- rownames(cv_binary_metrics_df)  # add an id column
+
+    long = cv_binary_metrics_df %>%
+    select(c(id, se)) %>%
+    reshape2::melt(id.vars = "id")
+
+    p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    facet_grid(~ variable, labeller = labeller(variable = c(se = "Sensitivity"))) + xlab("") + 
+    ylab("Accuracy") + ggtitle("Short-term rejection Sensitivity") + theme(plot.title = element_text(hjust = 0.5)) +
+      scale_x_discrete(labels = c()) + theme_bw() + theme(text = element_text(size = 17))
+    plotly::ggplotly(p)
+  }, error = function(e) {
+    print(as.character(e$message))
+  })
+})
+
+output$specificity_binary <- renderPlotly({
+  tryCatch({
+    cv_binary_metrics_df <- as.data.frame(cv_binary_metrics)  # convert matrix to data frame
+    cv_binary_metrics_df$id <- rownames(cv_binary_metrics_df)  # add an id column
+
+    long = cv_binary_metrics_df %>%
+    select(c(id, sp)) %>%
+    reshape2::melt(id.vars = "id")
+
+    p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    facet_grid(~ variable, labeller = labeller(variable = c(sp = "Specificity"))) + xlab("") + 
+    ylab("Accuracy") + ggtitle("Short-term rejection Specificity") + theme(plot.title = element_text(hjust = 0.5)) +
+      scale_x_discrete(labels = c()) + theme_bw() + theme(text = element_text(size = 17))
+    plotly::ggplotly(p)
+  }, error = function(e) {
+    print(as.character(e$message))
+  })
+})
+
+  
+ output$cadi_mae_plot = renderPlotly({
+  long = cv_cadi %>% select(X, mae) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("CADI Mean Absolute Error") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+output$cadi_rmse_plot = renderPlotly({
+  long = cv_cadi %>% select(X, rmse) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("CADI Root Mean Squared Error") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+output$cadi_rsquared_plot = renderPlotly({
+  long = cv_cadi %>% select(X, rsquared) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("CADI R Squared over") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+output$ifta_mae_plot = renderPlotly({
+  long = cv_ifta %>% select(X, mae) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("i-IFTA Mean Absolute Error") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+output$ifta_rmse_plot = renderPlotly({
+  long = cv_ifta %>% select(X, rmse) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("i-IFTA Root Mean Squared Error") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+output$ifta_rsquared_plot = renderPlotly({
+  long = cv_ifta %>% select(X, rsquared) %>% as.data.frame() %>% reshape2::melt(id.vars = "X")
+  p = ggplot(long, aes(y = value)) + geom_boxplot() +
+    ggtitle("i-IFTA R Squared") + 
+    theme(plot.title = element_text(hjust = 0.5)) + theme_bw() + theme(text = element_text(size = 17))
+  plotly::ggplotly(p)
+})
+
+  
+  output$column_names_binary = downloadHandler(
+    filename = function() {
+      paste("overview/column_names.csv", sep = "")
+    },
+    content = function(column_names_binary) {
+      file.copy("overview/column_names_binary", column_names_binary)
+    })
+  
+  output$column_names_cadi = downloadHandler(
+    filename = function() {
+      paste("overview/column_names_cadi.csv", sep = "")
+    },
+    content = function(column_names_cadi) {
+      file.copy("overview/column_names_cadi.csv", column_names_cadi)
+    })
+  
+  output$column_names_ifta = downloadHandler(
+    filename = function() {
+      paste("overview/column_names_ifta.csv", sep = "")
+    },
+    content = function(column_names_ifta) {
+      file.copy("overview/column_names_ifta.csv", column_names_ifta)
+    })
+}
+shinyApp(ui = ui, server = server)
+```
+
